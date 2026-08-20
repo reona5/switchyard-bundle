@@ -1,33 +1,36 @@
 # switchyard-bundle
 
-[NeMo Switchyard](https://github.com/NVIDIA-NeMo/Switchyard) をコンテナ 1 つで
-動かすための定義。OpenAI 互換のエンドポイントを `127.0.0.1:4100` に立て、
-リクエストごとに呼び先のモデルを選んで Fireworks へ中継する。
+A single-container setup for [NeMo Switchyard](https://github.com/NVIDIA-NeMo/Switchyard).
+It serves an OpenAI-compatible endpoint on `127.0.0.1:4100` and picks a model
+per request before relaying to Fireworks.
 
-クライアントは含めない。OpenAI 互換の口を喋るものなら何を繋いでもよく、
-繋ぐ側の設定はこのリポジトリの外側で持つ。
+No client is bundled and none is assumed. Anything that speaks the OpenAI API
+can point at the port, and the client's own configuration stays outside this
+repo.
 
-## ルート
+## Routes
 
-`routes.toml` で定義している。クライアントからはこの `id` がモデル名として見える。
+Defined in `routes.toml`. A route's `id` is the model name the client sees.
 
-| id | 中身 |
+| id | Behaviour |
 |---|---|
-| `auto` | 毎ターン judge が weak で足りるかを見積もって振り分ける |
-| `auto-esc` | 必ず weak で始まり、行き詰まりを 2 回続けて検出したら strong に固定する |
-| `weak-only` | DeepSeek V4 Flash に固定 |
-| `strong-only` | DeepSeek V4 Pro に固定 |
-| `k3-only` | Kimi K3 に固定（画像を読ませたいとき） |
+| `auto` | A judge estimates every turn whether the weak tier suffices |
+| `auto-esc` | Always starts weak, latches to strong once trouble is confirmed twice |
+| `weak-only` | Pinned to DeepSeek V4 Flash |
+| `strong-only` | Pinned to DeepSeek V4 Pro |
+| `k3-only` | Pinned to Kimi K3, for image input |
 
-`auto` と `auto-esc` の違いは上げ方だけではない。`auto-esc` は固定されるまで応答が
-バッファされるので真のストリーミングにならず、確定したターンでは両方の tier に
-課金され、一度上がるとセッション中は下がらない。
+`auto-esc` differs from `auto` in more than how it escalates. Responses are
+buffered until it latches, so streaming is not real; the confirming turn is
+billed on both tiers; and once raised it does not come back down for the rest of
+the session.
 
-## 使う
+## Running it
 
-Fireworks の API キーを環境変数で渡す。秘密管理の道具はあえて固定していないので、
-`op run` でも `.env` でも direnv でも、環境に入れられれば何でもよい。未設定のまま
-起動すると compose の parse 時点で落ちる。
+Pass the Fireworks API key through the environment. The secret store is
+deliberately not fixed here — `op run`, a `.env` file, direnv, anything that can
+put it in the environment will do. Starting without it fails while compose is
+still parsing.
 
 ```shell
 $ export FIREWORKS_API_KEY=fw_...
@@ -36,42 +39,36 @@ $ curl -s http://127.0.0.1:4100/health
 {"status":"ok"}
 ```
 
-止めるのは `docker compose down`。`restart: unless-stopped` を付けてあるので、
-明示的に止めるまでは Docker が上げ直す。
+Stop it with `docker compose down`. Because of `restart: unless-stopped`, Docker
+brings it back until you stop it explicitly.
 
-## 設定を変える
+## Changing the configuration
 
-`routes.toml` は compose から bind mount しているので、ルート定義をいじるだけなら
-イメージの再ビルドは要らない。ただし TOML の設定面は `deny_unknown_fields` なので、
-キー名を打ち間違えると起動時に落ちる。再起動する前に検証する。
+`routes.toml` is bind-mounted, so editing routes needs no image rebuild. The
+TOML surface is `deny_unknown_fields` though, so a mistyped key fails at
+startup. Validate before restarting:
 
 ```shell
 $ docker compose run --rm switchyard --config /app/routes.toml --dry-run
 ```
 
-## 様子を見る
+## Looking at what it does
 
 ```shell
-$ curl -s http://127.0.0.1:4100/v1/models | jq .      # 配信中のルート
-$ curl -s http://127.0.0.1:4100/v1/stats  | jq .      # 振り分けの集計
-$ docker compose logs -f                              # サーバのログ
+$ curl -s http://127.0.0.1:4100/v1/models | jq .   # routes being served
+$ curl -s http://127.0.0.1:4100/v1/stats  | jq .   # aggregate routing counts
+$ docker compose logs -f                           # server log
 ```
 
-リクエスト単位の判断は named volume の `routing.jsonl` に落ちている。イメージを
-再ビルドしても消えない。
+Per-request decisions land in `routing.jsonl` on a named volume, so they survive
+image rebuilds and `--force-recreate`:
 
 ```shell
 $ docker compose exec switchyard tail -f /app/logs/routing.jsonl
 ```
 
-## バージョン
+## Versions
 
-`Dockerfile` の `SWITCHYARD_VERSION` は crates.io のリリース版を固定している。
-main は次の開発サイクルの内部 API 変更を載せているので追わない。上げるときは
-`--dry-run` で設定面の互換を確かめてから。
-
-## 出典
-
-構成は [himorishige/switchyard-opencode-bundle](https://github.com/himorishige/switchyard-opencode-bundle)
-を下敷きにしている。`routes.toml` の閾値などの校正値もあちらの計測に基づくもので、
-ここで測り直したものではない。
+`SWITCHYARD_VERSION` in the `Dockerfile` pins a crates.io release. Do not follow
+`main` — it carries the next development cycle's internal Rust API churn. When
+bumping it, check the config surface with `--dry-run` first.
