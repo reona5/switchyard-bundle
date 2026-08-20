@@ -1,0 +1,43 @@
+# チェックアウト先のディレクトリ名に container/volume 名が左右されないよう固定する。
+name: switchyard
+
+services:
+  switchyard:
+    build: .
+    container_name: switchyard
+    ports:
+      # loopback のみ。ルータを LAN に晒さない。
+      - '127.0.0.1:4100:4100'
+    environment:
+      # .env は置かない。キーはホストの環境変数から素通しする前提で、注入の方法は
+      # 呼ぶ側に委ねる（秘密管理の道具を固定したくないため）。未設定なら parse 時に落とす。
+      # 割り切りとして、解決後のキーはコンテナの環境に載るので docker inspect からは
+      # 読める。ディスク上に平文を置かないところまでが呼ぶ側の責任範囲。
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:?set it in the environment before starting}
+    volumes:
+      - ./routes.toml:/app/routes.toml:ro
+      # bind mount ではなく named volume。ホスト側の権限問題を避けつつ、
+      # イメージ再ビルドや --force-recreate をまたいでログを残す。
+      - switchyard-logs:/app/logs
+    # イメージの CMD にリクエスト単位の JSONL ログを足す。
+    command:
+      [
+        '--config',
+        '/app/routes.toml',
+        '--host',
+        '0.0.0.0',
+        '--port',
+        '4100',
+        '--routing-log-file',
+        '/app/logs/routing.jsonl',
+      ]
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:4100/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  switchyard-logs:

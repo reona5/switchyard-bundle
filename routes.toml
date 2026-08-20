@@ -1,0 +1,99 @@
+# Switchyard native (Rust) server の設定。`switchyard-server --config` に渡す。
+#
+# Python 版の `switchyard serve`（route bundle の YAML）ではなくこちらを使う。
+# ルーティングアルゴリズムの実体は Rust 側に移っており、Python パッケージの
+# native path は upstream で deprecated になっている。
+#
+# routes のキーではなく各 route の `id` が、クライアントから見えるモデル ID になる。
+# クライアント側のモデル一覧と一対一で対応するので、片方だけ変えると選べなくなる。
+#
+# 編集したら再起動前に検証する（deny_unknown_fields なのでキー名の打ち間違いも落ちる）:
+#   docker compose run --rm switchyard --config /app/routes.toml --dry-run
+#
+# 構成の下敷きは himorishige/switchyard-opencode-bundle。閾値などの校正値は
+# あちらの計測に基づくもので、ここで測り直したものではない。
+
+schema_version = 1
+
+[llm_clients.fireworks]
+format = "openai_chat"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+
+# judge 用に client を分ける。server は (llm_client, model id) の組で target を
+# 重複排除するので、classifier と weak が同じ model id を指していると extra_body
+# の違いに関わらずどちらかが黙って消える。client 名を変えることで両方残る。
+[llm_clients.fireworks_judge]
+format = "openai_chat"
+base_url = "https://api.fireworks.ai/inference/v1"
+api_key_env = "FIREWORKS_API_KEY"
+
+# classifier は weak と同じモデルを judge として兼用する。
+# judge の出力は確率であって文章ではないので、思考させても時間とトークンを
+# 捨てるだけになる。Fireworks は model card に載っていない "none" を受ける。
+# temperature 0 は閾値際の判定が再実行ごとに揺れるのを抑えるため。
+[targets.classifier]
+id = "accounts/fireworks/models/deepseek-v4-flash-0731"
+llm_client = "fireworks_judge"
+extra_body = { reasoning_effort = "none", temperature = 0 }
+
+[targets.weak]
+id = "accounts/fireworks/models/deepseek-v4-flash-0731"
+llm_client = "fireworks"
+
+[targets.strong]
+id = "accounts/fireworks/models/deepseek-v4-pro-0813"
+llm_client = "fireworks"
+
+# K3 は k3-only 専用の座席。strong（V4 Pro）は画像を読まないので、画像を投げたい
+# ときはこちらを明示的に選ぶ。この id を共有する target は他にないので、
+# 素の fireworks client を使い回して問題ない。
+[targets.k3]
+id = "accounts/fireworks/models/kimi-k3"
+llm_client = "fireworks"
+
+# 既定ルート。judge が weak で足りるかを毎ターン見積もって振り分ける。
+[routes.auto]
+id = "auto"
+type = "llm_classifier"
+mode = "capability"
+classifier_target = "classifier"
+strong_target = "strong"
+weak_target = "weak"
+base_threshold = 0.75
+threshold_step = 0.1
+session_affinity = true
+message_hash_fallback = true
+# judge に見せる会話の長さ。既定（未設定）だと最初のタスクと最新の user 発言しか
+# 読まないため、作業の途中では判断材料が足りず judge が自力で考え込む。直近の
+# assistant 応答と tool 結果まで見せると即断できる。tool の呼び出しと結果は
+# 分割されない（窓の開始位置が繰り上がる）。
+recent_turn_window = 4
+
+# 証拠が出てから上げる版。必ず weak で始まり、同じ失敗の繰り返しや偽の進捗を
+# judge が 2 回連続で検出したら strong に固定する。auto との差は、固定されるまで
+# 応答がバッファされる（真のストリーミングにならない）点と、確定ターンで両方の
+# tier に課金される点、そして一度上がるとセッション中は下がらない点。
+[routes.auto-esc]
+id = "auto-esc"
+type = "llm_classifier"
+mode = "escalation"
+classifier_target = "classifier"
+strong_target = "strong"
+weak_target = "weak"
+escalation = { confirmations = 2 }
+
+[routes.weak-only]
+id = "weak-only"
+type = "passthrough"
+target = "weak"
+
+[routes.strong-only]
+id = "strong-only"
+type = "passthrough"
+target = "strong"
+
+[routes.k3-only]
+id = "k3-only"
+type = "passthrough"
+target = "k3"
